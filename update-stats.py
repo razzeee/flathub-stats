@@ -213,10 +213,11 @@ parser.add_argument(
 args = parser.parse_args()
 
 refs_cache = flathub.load_cache(args.ref_cache_path)
+flathub.prepare_logs(args.logfiles, refs_cache)
 
 downloads = []
 for logname in args.logfiles:
-    d = flathub.parse_log(logname, refs_cache, args.ignore_deltas)
+    d = flathub.parse_log(logname, refs_cache, args.ignore_deltas, prepared=True)
     downloads = downloads + d
 
 refs_cache.save(args.ref_cache_path)

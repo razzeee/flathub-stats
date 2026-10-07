@@ -34,7 +34,7 @@ class CommitCache:
 
         self.valid_arches: set[str] = set()
         self.commit_map: dict[str | None, list[str | None]] = commit_map
-        self.dirtree_map: dict[str | None, str | None] = {}
+        self.dirtree_map: dict[str, set[str]] = {}
         self.modified = False
 
         try:
@@ -70,7 +70,7 @@ class CommitCache:
         for commit, cached_data in list(self.commit_map.items()):
             dirtree = cached_data[1]
             if dirtree:
-                self.dirtree_map[dirtree] = commit
+                self.dirtree_map.setdefault(dirtree, set()).add(commit)
 
         self.summary_map = {}
         url = "https://dl.flathub.org/repo/summary"
@@ -123,7 +123,7 @@ class CommitCache:
         self.modified = True
         self.commit_map[commit] = [ref, root_dirtree]
         if root_dirtree:
-            self.dirtree_map[root_dirtree] = commit
+            self.dirtree_map.setdefault(root_dirtree, set()).add(commit)
 
     def has_commit(self, commit):
         return commit in self.commit_map
@@ -133,8 +133,14 @@ class CommitCache:
         if pair:
             return pair[0]
 
-    def lookup_by_dirtree(self, dirtree) -> str | None:
-        return self.dirtree_map.get(dirtree, None)
+    def lookup_by_dirtree(self, dirtree, ref=None) -> str | None:
+        commits = self.dirtree_map.get(dirtree, set())
+        if ref:
+            commits = {commit for commit in commits if self.lookup_ref(commit) == ref}
+        # Shared roots are safe to attribute only when the ref is unambiguous.
+        if commits and len({self.lookup_ref(commit) for commit in commits}) == 1:
+            return min(commits)
+        return None
 
     def save(self, path):
         if self.modified:
@@ -209,7 +215,44 @@ def should_keep_ref(ref: str, valid_arches: set[str]) -> bool:
     )
 
 
-def parse_log(logname: str, cache: CommitCache, ignore_deltas=False):
+def prepare_logs(lognames, cache: CommitCache):
+    """Resolve metadata across the entire batch before counting any dirtrees."""
+    for logname in lognames:
+        opener = gzip.open if str(logname).endswith(".gz") else open
+        with opener(logname, "rt", encoding="utf-8", errors="replace") as stream:
+            for line in stream:
+                match = fastly_log_re.match(line)
+                if not match or match.group(3) != "GET" or match.group(6) != "200":
+                    continue
+                ref = match.group(10) or None
+                if ref and not should_keep_ref(ref, cache.valid_arches):
+                    continue
+                path = match.group(4)
+                commit = None
+                if path.startswith("/repo/deltas/") and path.endswith("/superblock"):
+                    delta = path[len("/repo/deltas/") : -len("/superblock")].replace(
+                        "/", ""
+                    )
+                    commit = deltaid_to_commit(delta.rsplit("-", 1)[-1])
+                elif path.startswith("/repo/objects/") and path.endswith(".commit"):
+                    candidate = path[len("/repo/objects/") : -len(".commit")].replace(
+                        "/", ""
+                    )
+                    if re.fullmatch(r"[a-f0-9]{64}", candidate):
+                        commit = candidate
+                elif not (
+                    path.startswith("/repo/objects/") and path.endswith(".dirtree")
+                ):
+                    continue
+                if ref:
+                    cache.update_from_summary(ref)
+                if commit and not cache.has_commit(commit):
+                    cache.update_for_commit(commit, ref)
+
+
+def parse_log(logname: str, cache: CommitCache, ignore_deltas=False, *, prepared=False):
+    if not prepared:
+        prepare_logs([logname], cache)
     print(f"loading log {logname}")
 
     downloads = []
@@ -300,7 +343,7 @@ def parse_log(logname: str, cache: CommitCache, ignore_deltas=False):
                     "/", ""
                 )
                 # Look up via the reverse map for all the commits we've seen so far
-                commit = cache.lookup_by_dirtree(dirtree)
+                commit = cache.lookup_by_dirtree(dirtree, target_ref)
                 if not commit:
                     continue  # No match, probably not a root dirtree (although could be commit we never saw before)
             else:
@@ -379,8 +422,10 @@ def parse_log(logname: str, cache: CommitCache, ignore_deltas=False):
 
 if __name__ == "__main__":
     logs = []
+    cache = CommitCache({})
+    prepare_logs(sys.argv[1:], cache)
     for logname in sys.argv[1:]:
-        log = parse_log(logname, CommitCache({}))
+        log = parse_log(logname, cache, prepared=True)
         logs = logs + log
     for log in logs:
         print(log)
