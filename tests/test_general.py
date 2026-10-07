@@ -1,13 +1,11 @@
 #!/usr/bin/env python3
 
-import json
-import subprocess
-import sys
 from pathlib import Path
 
 from typing import Any
 
 import flathub
+from tests.helpers import run_stats
 
 
 def _create_log_line(ref: str) -> str:
@@ -20,38 +18,19 @@ def _create_log_line(ref: str) -> str:
     )
 
 
-def _run_stats(test_log: Path, tmp_path: Path) -> dict[str, Any]:
-    stats_dir: Path = tmp_path / "stats"
-    result: subprocess.CompletedProcess[str] = subprocess.run(
-        [
-            sys.executable,
-            "update-stats.py",
-            str(test_log),
-            "--dest",
-            str(stats_dir),
-            "--ref-cache",
-            str(tmp_path / "ref-cache.json"),
-        ],
-        cwd=Path(__file__).parent.parent,
-        capture_output=True,
-        text=True,
+def _run_stats(test_log: Path, tmp_path: Path, monkeypatch) -> dict[str, Any]:
+    return run_stats(
+        monkeypatch, [test_log], tmp_path / "stats", tmp_path / "ref-cache.json"
     )
-    assert result.returncode == 0, f"Failed to process stats: {result.stderr}"
-
-    output_file: Path = stats_dir / "2023" / "05" / "16.json"
-    with open(output_file) as f:
-        data: dict[str, Any] = json.load(f)
-
-    return data
 
 
-def test_json_structure(tmp_path: Path) -> None:
+def test_json_structure(tmp_path: Path, monkeypatch) -> None:
     test_log: Path = tmp_path / "test-structure.log"
 
     with open(test_log, "w") as f:
         f.write(_create_log_line("runtime/org.freedesktop.Platform/x86_64/23.08"))
 
-    data: dict[str, Any] = _run_stats(test_log, tmp_path)
+    data: dict[str, Any] = _run_stats(test_log, tmp_path, monkeypatch)
 
     assert data["date"] == "2023/05/16"
 
@@ -115,24 +94,24 @@ def test_valid_summary_arches_loaded(tmp_path: Path) -> None:
     assert isinstance(cache.valid_arches, set)
     assert len(cache.valid_arches) > 0
 
-    assert {"x86_64", "aarch64", "i386"}.issubset(cache.valid_arches)
+    assert {"x86_64", "aarch64", "i386", "riscv64"}.issubset(cache.valid_arches)
 
 
-def test_exclude_invalid_arches(tmp_path: Path) -> None:
+def test_exclude_invalid_arches(tmp_path: Path, monkeypatch) -> None:
     test_log: Path = tmp_path / "test-invalid-arch.log"
 
     with open(test_log, "w") as f:
         f.write(_create_log_line("app/org.example.ValidApp/x86_64/stable"))
         f.write(_create_log_line("app/org.example.InvalidApp/abracadabra/stable"))
 
-    data: dict[str, Any] = _run_stats(test_log, tmp_path)
+    data: dict[str, Any] = _run_stats(test_log, tmp_path, monkeypatch)
 
     assert "org.example.ValidApp" in data["refs"]
     assert "org.example.InvalidApp" not in data["refs"]
     assert len(data["refs"]) == 1
 
 
-def test_exclude_debug_locale_source_refs(tmp_path: Path) -> None:
+def test_exclude_debug_locale_source_refs(tmp_path: Path, monkeypatch) -> None:
     test_log: Path = tmp_path / "test-filtered-runtimes.log"
 
     with open(test_log, "w") as f:
@@ -143,7 +122,7 @@ def test_exclude_debug_locale_source_refs(tmp_path: Path) -> None:
         )
         f.write(_create_log_line("runtime/org.freedesktop.Sdk.Sources/x86_64/23.08"))
 
-    data: dict[str, Any] = _run_stats(test_log, tmp_path)
+    data: dict[str, Any] = _run_stats(test_log, tmp_path, monkeypatch)
 
     assert "org.freedesktop.Platform/23.08" in data["refs"]
     assert "org.freedesktop.Platform.Debug/23.08" not in data["refs"]
@@ -152,14 +131,14 @@ def test_exclude_debug_locale_source_refs(tmp_path: Path) -> None:
     assert len(data["refs"]) == 1
 
 
-def test_includes_valid_refs(tmp_path: Path) -> None:
+def test_includes_valid_refs(tmp_path: Path, monkeypatch) -> None:
     test_log: Path = tmp_path / "test-valid-refs.log"
 
     with open(test_log, "w") as f:
         f.write(_create_log_line("app/org.mozilla.Firefox/x86_64/stable"))
         f.write(_create_log_line("runtime/org.freedesktop.Platform/x86_64/23.08"))
 
-    data: dict[str, Any] = _run_stats(test_log, tmp_path)
+    data: dict[str, Any] = _run_stats(test_log, tmp_path, monkeypatch)
 
     assert "org.mozilla.Firefox" in data["refs"]
     assert "org.freedesktop.Platform/23.08" in data["refs"]

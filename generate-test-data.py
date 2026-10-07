@@ -16,6 +16,7 @@ parser.add_argument(
     help="Number of log entries to generate",
     default=1000,
 )
+parser.add_argument("--output", type=Path, default=Path("test/test-data.log"))
 args = parser.parse_args()
 
 # Use provided seed or generate one
@@ -128,10 +129,10 @@ def data_row() -> str:
     return f'{fake_ip()} "-" "-" [{day}] "GET {app[0]} HTTP/1.1" 200 {fake.random_number(digits=12)} "" "{fake_user_agent()}" "{app[1]}" "{fake_is_update()}" {fake.country_code()} "{os_info}"'
 
 
-Path("test").mkdir(parents=True, exist_ok=True)
+args.output.parent.mkdir(parents=True, exist_ok=True)
 
 # write to file
-with open("test/test-data.log", "w") as f:
+with args.output.open("w") as f:
     for i in range(args.count):
         f.write(data_row() + "\n")
 

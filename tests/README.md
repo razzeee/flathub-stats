@@ -6,13 +6,13 @@ This directory contains tests for the flathub-stats project.
 
 ```bash
 # Run all tests
-uv run pytest tests/ -v
+uv run --all-groups pytest tests/ -v
 
 # Run with coverage
-uv run pytest tests/ -v --cov=. --cov-report=term-missing
+uv run --all-groups pytest tests/ -v --cov=. --cov-report=term-missing
 
 # Run snapshot tests only
-uv run pytest tests/test_snapshots.py -v
+uv run --all-groups pytest tests/test_snapshots.py -v
 ```
 
 ## Snapshot Tests
@@ -24,7 +24,12 @@ The snapshot tests use [syrupy](https://github.com/tophat/syrupy) to verify the 
 Each test:
 1. Generates test data using `generate-test-data.py` with a **specific seed** for reproducibility
 2. Runs `update-stats.py` on the generated data
-3. Compares the output JSON against a stored snapshot
+3. Processes it with deterministic, offline repository metadata
+4. Compares the output JSON against a stored snapshot
+
+Generated logs live in each test's temporary directory. Tests do not overwrite
+`test/test-data.log`, and all metadata requests are mocked; live CDN availability
+and changes in current repository contents cannot affect the results.
 
 ### Updating Snapshots
 
