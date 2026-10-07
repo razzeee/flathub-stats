@@ -1,5 +1,6 @@
 *.pyc
 ref-cache.json
+ref-cache.json.lock
 .venv
 __pycache__
 stats

@@ -5,6 +5,7 @@ import json
 import os.path
 
 import flathub
+from stats_io import atomic_json_write, file_lock
 
 refs_cache = None
 
@@ -212,31 +213,31 @@ parser.add_argument(
 )
 args = parser.parse_args()
 
-refs_cache = flathub.load_cache(args.ref_cache_path)
+with (
+    file_lock(args.ref_cache_path + ".lock"),
+    file_lock(os.path.join(args.dest, ".ingestion.lock")),
+):
+    refs_cache = flathub.load_cache(args.ref_cache_path)
 
-downloads = []
-for logname in args.logfiles:
-    d = flathub.parse_log(logname, refs_cache, args.ignore_deltas)
-    downloads = downloads + d
+    downloads = []
+    for logname in args.logfiles:
+        d = flathub.parse_log(logname, refs_cache, args.ignore_deltas)
+        downloads = downloads + d
 
-refs_cache.save(args.ref_cache_path)
+    refs_cache.save(args.ref_cache_path)
 
-days = {}
+    days = {}
 
-for d in downloads:
-    date = d[flathub.DATE]
-    day = days.get(date)
-    if not day:
-        day = load_dayinfo(args.dest, date)
-        days[date] = day
-    day.add(d)
+    for d in downloads:
+        date = d[flathub.DATE]
+        day = days.get(date)
+        if not day:
+            day = load_dayinfo(args.dest, date)
+            days[date] = day
+        day.add(d)
 
-for date in days:
-    day = days[date]
-    path = os.path.join(args.dest, date + ".json")
-    directory = os.path.dirname(path)
-    if not os.path.exists(directory):
-        os.makedirs(directory, 0o755)
-    print(f"saving updated stats {path}")
-    with open(path, "w") as f:
-        json.dump(day, f, default=lambda x: x.__dict__, sort_keys=True, indent=4)
+    for date in days:
+        day = days[date]
+        path = os.path.join(args.dest, date + ".json")
+        print(f"saving updated stats {path}")
+        atomic_json_write(path, json.loads(json.dumps(day, default=vars)))

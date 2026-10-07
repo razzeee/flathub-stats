@@ -13,6 +13,8 @@ import urllib.request
 
 from gi.repository import GLib  # type: ignore[import-untyped]
 
+from stats_io import atomic_json_write
+
 
 def load_cache(path):
     commit_map = {}
@@ -138,12 +140,7 @@ class CommitCache:
 
     def save(self, path):
         if self.modified:
-            try:
-                with open(path, "w") as f:
-                    json.dump(self.commit_map, f, indent=4)
-            except OSError:
-                print("Failed to save cache")
-                pass
+            atomic_json_write(path, self.commit_map)
             self.modified = False
 
 
