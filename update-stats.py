@@ -3,8 +3,12 @@
 import argparse
 import json
 import os.path
+from contextlib import closing
+from pathlib import Path
 
 import flathub
+from stats_io import file_lock
+from stats_store import StatsStore, input_digest, snapshot_input
 
 refs_cache = None
 
@@ -208,35 +212,61 @@ parser.add_argument(
     "--ignore-deltas", action="store_true", help="ignore deltas in the log"
 )
 parser.add_argument(
+    "--reprocess",
+    action="store_true",
+    help="replace previously recorded contributions for these inputs",
+)
+parser.add_argument(
     "logfiles", metavar="LOGFILE", type=str, help="path to log file", nargs="+"
 )
 args = parser.parse_args()
 
-refs_cache = flathub.load_cache(args.ref_cache_path)
+with (
+    file_lock(args.ref_cache_path + ".lock"),
+    file_lock(Path(args.dest) / ".ingestion.lock"),
+    closing(StatsStore(args.dest)) as store,
+):
+    store.publish()  # Repair interrupted publication before accepting new input.
+    pending = {}
+    for logname in args.logfiles:
+        digest = input_digest(logname)
+        if store.already_processed(digest, args.ignore_deltas, args.reprocess):
+            print(f"Skipping already processed log {logname}")
+        else:
+            pending.setdefault(digest, logname)
 
-downloads = []
-for logname in args.logfiles:
-    d = flathub.parse_log(logname, refs_cache, args.ignore_deltas)
-    downloads = downloads + d
-
-refs_cache.save(args.ref_cache_path)
-
-days = {}
-
-for d in downloads:
-    date = d[flathub.DATE]
-    day = days.get(date)
-    if not day:
-        day = load_dayinfo(args.dest, date)
-        days[date] = day
-    day.add(d)
-
-for date in days:
-    day = days[date]
-    path = os.path.join(args.dest, date + ".json")
-    directory = os.path.dirname(path)
-    if not os.path.exists(directory):
-        os.makedirs(directory, 0o755)
-    print(f"saving updated stats {path}")
-    with open(path, "w") as f:
-        json.dump(day, f, default=lambda x: x.__dict__, sort_keys=True, indent=4)
+    if pending:
+        refs_cache = flathub.load_cache(args.ref_cache_path)
+        with store.db:
+            touched = set()
+            for digest, logname in pending.items():
+                days = {}
+                with snapshot_input(logname) as (snapshot, copied_digest):
+                    if copied_digest != digest:
+                        raise ValueError(f"Log changed during processing: {logname}")
+                    for event in flathub.parse_log(
+                        snapshot, refs_cache, args.ignore_deltas
+                    ):
+                        date = event[flathub.DATE]
+                        if date not in days:
+                            days[date] = DayInfo(date)
+                        days[date].add(event)
+                if input_digest(logname) != digest:
+                    raise ValueError(f"Log changed during processing: {logname}")
+                touched.update(
+                    store.replace_input(
+                        digest,
+                        logname,
+                        args.ignore_deltas,
+                        {
+                            date: json.loads(json.dumps(day, default=vars))
+                            for date, day in days.items()
+                        },
+                    )
+                )
+            store.rebuild_days(
+                touched,
+                lambda date: json.loads(json.dumps(DayInfo(date), default=vars)),
+            )
+            refs_cache.save(args.ref_cache_path)
+        store.publish()
