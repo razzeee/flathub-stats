@@ -8,10 +8,34 @@ import re
 import sys
 import time
 import urllib.error
-import urllib.parse
 import urllib.request
 
 from gi.repository import GLib  # type: ignore[import-untyped]
+
+
+def fetch_metadata(url):
+    """Bound network stalls and retry transient failures, not missing objects."""
+    for attempt in range(3):
+        try:
+            with urllib.request.urlopen(url, timeout=15) as response:
+                data = response.read()
+                if not data:
+                    raise OSError(f"Empty metadata response: {url}")
+                return data
+        except OSError as error:
+            if isinstance(error, urllib.error.HTTPError) and error.code not in (
+                408,
+                429,
+                500,
+                502,
+                503,
+                504,
+            ):
+                raise
+            if attempt == 2:
+                raise
+            time.sleep(0.5 * (attempt + 1))
+    raise AssertionError("unreachable")
 
 
 def load_cache(path):
@@ -20,9 +44,8 @@ def load_cache(path):
         print(f"Loading cache from {path}")
         with open(path) as f:
             commit_map = json.loads(f.read())
-    except OSError:
-        print("Failed to load cache")
-        pass
+    except FileNotFoundError:
+        print("Starting a new commit cache")
 
     return CommitCache(commit_map)
 
@@ -32,51 +55,51 @@ class CommitCache:
         # flatpak_is_valid_arch()
         arch_re = re.compile(r"^[A-Za-z0-9_]+$")
 
-        self.valid_arches: set[str] = set()
-        self.commit_map: dict[str | None, list[str | None]] = commit_map
+        self.valid_arches: set[str] = {"x86_64", "aarch64", "i386", "arm"}
+        self.commit_map: dict[str, list[str | None]] = {}
         self.dirtree_map: dict[str | None, str | None] = {}
+        self.failed_commits: set[str] = set()
+        self.resolution_failures = 0
         self.modified = False
 
         try:
             url = "https://dl.flathub.org/repo/summary.idx"
-            response = urllib.request.urlopen(url)
-            summary_idx = response.read()
+            summary_idx = fetch_metadata(url)
 
             if summary_idx:
                 idx_gvar = GLib.Variant.new_from_bytes(
                     GLib.VariantType.new("(a{s(ayaaya{sv})}a{sv})"),
                     GLib.Bytes.new(summary_idx),
-                    True,
+                    False,
                 )
                 sub_sum_arr = idx_gvar.get_child_value(0)
                 for sub_sum_name in sub_sum_arr.keys():
                     if arch_re.fullmatch(sub_sum_name):
                         self.valid_arches.add(sub_sum_name)
-        except OSError as err:
+        except (OSError, GLib.Error) as err:
             print(f"Failed to load summary.idx: {err}")
-            self.valid_arches = {"x86_64", "aarch64"}
 
-        # Backwards compat, re-resolve all commits where we don't have root dirtree info
-        # Also remove uninteresting things from the cache
-        for commit, cached_data in list(self.commit_map.items()):
-            if not isinstance(cached_data, list):
-                ref = cached_data
-                # Older version saved uninteresting refs in the cache, but we don't need them anymore
-                if ref and should_keep_ref(ref, self.valid_arches):
-                    self.update_for_commit(commit, ref)
-                else:
-                    del self.commit_map[commit]
-
-        for commit, cached_data in list(self.commit_map.items()):
-            dirtree = cached_data[1]
+        # Keep legacy ref-only entries as hints rather than treating them as
+        # complete metadata or permanently caching failed resolutions.
+        for commit, cached_data in commit_map.items():
+            pair = cached_data if isinstance(cached_data, list) else [cached_data, None]
+            self.commit_map[commit] = pair
+            ref, dirtree = pair
+            if ref and len(ref.split("/")) == 4:
+                self.valid_arches.add(ref.split("/")[2])
             if dirtree:
                 self.dirtree_map[dirtree] = commit
+
+        # Recover historical roots even when the log supplies only a dirtree
+        # and no ref header. This also preserves the old ref-only cache migration.
+        for commit, (ref, dirtree) in list(self.commit_map.items()):
+            if ref and not dirtree and should_keep_ref(ref, self.valid_arches):
+                self.update_for_commit(commit, ref)
 
         self.summary_map = {}
         url = "https://dl.flathub.org/repo/summary"
         try:
-            response = urllib.request.urlopen(url)
-            summaryv = response.read()
+            summaryv = fetch_metadata(url)
             if summaryv:
                 v = GLib.Variant.new_from_bytes(
                     GLib.VariantType.new("(a(s(taya{sv}))a{sv})"),
@@ -87,7 +110,7 @@ class CommitCache:
                     self.summary_map[m[0]] = binascii.hexlify(
                         bytearray(m[1][1])
                     ).decode("utf-8")
-        except OSError:
+        except (OSError, GLib.Error):
             print("Failed to load summary: ")
             print(sys.exc_info())
             pass
@@ -98,13 +121,14 @@ class CommitCache:
             self.update_for_commit(commit, branch)
 
     def update_for_commit(self, commit: str, known_branch: str | None = None):
-        ref = known_branch
+        if self.has_commit(commit) or commit in self.failed_commits:
+            return
+        ref = known_branch or self.lookup_ref(commit)
         root_dirtree = None
         url = f"https://dl.flathub.org/repo/objects/{commit[0:2]}/{commit[2:]}.commit"
         print(f"Resolving {commit}", end=" ")
         try:
-            response = urllib.request.urlopen(url)
-            commitv = response.read()
+            commitv = fetch_metadata(url)
             if commitv:
                 v = GLib.Variant.new_from_bytes(
                     GLib.VariantType.new("(a{sv}aya(say)sstayay)"),
@@ -116,9 +140,13 @@ class CommitCache:
                 elif "ostree.ref-binding" in v[0]:
                     ref = v[0]["ostree.ref-binding"][0]
                 root_dirtree = binascii.hexlify(bytearray(v[6])).decode("utf-8")
-        except OSError:
+                if not re.fullmatch(r"[a-f0-9]{64}", root_dirtree):
+                    raise ValueError("Invalid root dirtree checksum")
+        except (OSError, GLib.Error, ValueError, IndexError):
             print("Failed to resolve commit")
-            pass
+            self.failed_commits.add(commit)
+            self.resolution_failures += 1
+            return
         print(f"-> {ref}, {root_dirtree}")
         self.modified = True
         self.commit_map[commit] = [ref, root_dirtree]
@@ -126,7 +154,8 @@ class CommitCache:
             self.dirtree_map[root_dirtree] = commit
 
     def has_commit(self, commit):
-        return commit in self.commit_map
+        pair = self.commit_map.get(commit)
+        return bool(pair and pair[0] and pair[1])
 
     def lookup_ref(self, commit):
         pair = self.commit_map.get(commit, None)
