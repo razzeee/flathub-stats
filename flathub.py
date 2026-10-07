@@ -10,6 +10,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections import Counter
 
 from gi.repository import GLib  # type: ignore[import-untyped]
 
@@ -209,8 +210,10 @@ def should_keep_ref(ref: str, valid_arches: set[str]) -> bool:
     )
 
 
-def parse_log(logname: str, cache: CommitCache, ignore_deltas=False):
+def parse_log(logname: str, cache: CommitCache, ignore_deltas=False, *, quality=None):
     print(f"loading log {logname}")
+    if quality is None:
+        quality = Counter()
 
     downloads = []
 
@@ -234,6 +237,8 @@ def parse_log(logname: str, cache: CommitCache, ignore_deltas=False):
         if match:
             line_re = fastly_log_re
         else:
+            quality["lines"] += 1
+            quality["malformed"] += 1
             raise Exception("Unknown log format")
 
         while True:
@@ -251,13 +256,16 @@ def parse_log(logname: str, cache: CommitCache, ignore_deltas=False):
                 break
             line_str = line.decode("utf-8") if isinstance(line, bytes) else line
             match = line_re.match(line_str)
+            quality["lines"] += 1
             if not match:
+                quality["malformed"] += 1
                 sys.stderr.write(f"Warning: Can't match line: {line[:-1]}\n")
                 continue
             op = match.group(3)
             result = match.group(6)
             path = match.group(4)
             if op != "GET" or result != "200":
+                quality["filtered"] += 1
                 continue
 
             target_ref: str | None = match.group(10)
@@ -268,6 +276,7 @@ def parse_log(logname: str, cache: CommitCache, ignore_deltas=False):
             if target_ref is not None and not should_keep_ref(
                 target_ref, cache.valid_arches
             ):
+                quality["filtered"] += 1
                 continue
 
             # Ensure we have (at least) the current HEAD for this branch cached.
@@ -281,6 +290,7 @@ def parse_log(logname: str, cache: CommitCache, ignore_deltas=False):
             is_delta = False
             if path.startswith("/repo/deltas/") and path.endswith("/superblock"):
                 if ignore_deltas:
+                    quality["filtered"] += 1
                     continue
                 delta = path[len("/repo/deltas/") : -len("/superblock")].replace(
                     "/", ""
@@ -293,6 +303,7 @@ def parse_log(logname: str, cache: CommitCache, ignore_deltas=False):
 
                 commit = deltaid_to_commit(target)
                 if not commit:
+                    quality["malformed"] += 1
                     continue
 
             elif path.startswith("/repo/objects/") and path.endswith(".dirtree"):
@@ -302,9 +313,11 @@ def parse_log(logname: str, cache: CommitCache, ignore_deltas=False):
                 # Look up via the reverse map for all the commits we've seen so far
                 commit = cache.lookup_by_dirtree(dirtree)
                 if not commit:
+                    quality["unresolved_dirtrees"] += 1
                     continue  # No match, probably not a root dirtree (although could be commit we never saw before)
             else:
                 # Some other kind of log line, ignore
+                quality["filtered"] += 1
                 continue
 
             # Maybe this is a new commit, if so cache it for future use
@@ -317,18 +330,25 @@ def parse_log(logname: str, cache: CommitCache, ignore_deltas=False):
 
             if not target_ref:
                 print("Unable to figure out ref for commit " + str(commit))
+                quality["unresolved_refs"] += 1
                 continue
 
             # Late bailout, as we're now sure of the ref
             if not should_keep_ref(target_ref, cache.valid_arches):
+                quality["filtered"] += 1
                 continue
 
             date_str = match.group(2)
             if not date_str.endswith(" +0000"):
+                quality["malformed"] += 1
                 sys.stderr.write(f"Unhandled date timezone: {date_str}\n")
                 continue
             date_str = date_str[:-6]
-            date_struct = time.strptime(date_str, "%d/%b/%Y:%H:%M:%S")
+            try:
+                date_struct = time.strptime(date_str, "%d/%b/%Y:%H:%M:%S")
+            except ValueError:
+                quality["malformed"] += 1
+                continue
             date = f"{date_struct.tm_year}/{date_struct.tm_mon:02d}/{date_struct.tm_mday:02d}"
 
             user_agent = match.group(9)
@@ -373,6 +393,11 @@ def parse_log(logname: str, cache: CommitCache, ignore_deltas=False):
                 os_version,
             )
             downloads.append(download)
+            quality["counted"] += 1
+            if not os_version:
+                quality["missing_os"] += 1
+            if not flatpak_version:
+                quality["missing_flatpak_version"] += 1
 
     return downloads
 

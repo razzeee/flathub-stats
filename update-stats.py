@@ -3,6 +3,7 @@
 import argparse
 import json
 import os.path
+from collections import Counter
 
 import flathub
 
@@ -216,7 +217,13 @@ refs_cache = flathub.load_cache(args.ref_cache_path)
 
 downloads = []
 for logname in args.logfiles:
-    d = flathub.parse_log(logname, refs_cache, args.ignore_deltas)
+    quality = Counter()
+    try:
+        d = list(
+            flathub.parse_log(logname, refs_cache, args.ignore_deltas, quality=quality)
+        )
+    finally:
+        print(f"Quality {logname}: {json.dumps(dict(quality), sort_keys=True)}")
     downloads = downloads + d
 
 refs_cache.save(args.ref_cache_path)
