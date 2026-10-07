@@ -1,16 +1,20 @@
 #!/usr/bin/env python3
 
 import argparse
+import hashlib
 import json
-import os.path
+from collections import Counter
+from contextlib import closing
+from pathlib import Path
 
 import flathub
-
-refs_cache = None
+from stats_store import StatsStore, file_lock
 
 
 def ref_to_id(ref: str) -> str | None:
     parts = ref.split("/")
+    if len(parts) != 4 or not all(parts):
+        return None
     if parts[0] == "app":
         return parts[1]
     if parts[0] == "runtime" and not (
@@ -133,7 +137,6 @@ class DayInfo:
         return self.ref_by_os_version[id]
 
     def add(self, download):
-        download[flathub.CHECKSUM]
         ref = download[flathub.REF]
 
         if not ref:
@@ -182,61 +185,92 @@ class DayInfo:
                 self.os_flatpak_versions[os_version].get(flatpak_version, 0) + 1
             )
 
-
-def load_dayinfo(dest, date) -> DayInfo:
-    day = DayInfo(date)
-    path = os.path.join(dest, date + ".json")
-    if os.path.exists(path):
-        with open(path) as day_f:
-            dct = json.loads(day_f.read())
-            day = DayInfo(dct["date"])
-            day.from_dict(dct)
-    return day
+    def to_dict(self):
+        return json.loads(json.dumps(self, default=vars))
 
 
-parser = argparse.ArgumentParser()
-parser.add_argument("--dest", type=str, help="path to destination dir", default="stats")
-parser.add_argument(
-    "--ref-cache",
-    type=str,
-    dest="ref_cache_path",
-    metavar="REFCACHE",
-    default="ref-cache.json",
-    help="path to ref-cache.json",
-)
-parser.add_argument(
-    "--ignore-deltas", action="store_true", help="ignore deltas in the log"
-)
-parser.add_argument(
-    "logfiles", metavar="LOGFILE", type=str, help="path to log file", nargs="+"
-)
-args = parser.parse_args()
+def main(argv=None):
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--dest", type=Path, default=Path("stats"), help="path to destination dir"
+    )
+    parser.add_argument(
+        "--ref-cache",
+        dest="ref_cache_path",
+        default="ref-cache.json",
+        help="path to ref-cache.json",
+    )
+    parser.add_argument(
+        "--ignore-deltas", action="store_true", help="ignore deltas in the log"
+    )
+    parser.add_argument(
+        "--reprocess",
+        action="store_true",
+        help="replace previously recorded contributions for these inputs",
+    )
+    parser.add_argument(
+        "logfiles", metavar="LOGFILE", nargs="+", help="immutable log files"
+    )
+    args = parser.parse_args(argv)
 
-refs_cache = flathub.load_cache(args.ref_cache_path)
+    # Shared caches and destinations each need serialization, including exports.
+    with (
+        file_lock(args.ref_cache_path + ".lock"),
+        file_lock(args.dest / ".ingestion.lock"),
+    ):
+        with closing(StatsStore(args.dest)) as store:
+            store.publish()  # Recover publication after an interrupted previous run.
+            pending = {}
+            for logname in args.logfiles:
+                digest = flathub.log_digest(logname)
+                if store.already_processed(digest, args.ignore_deltas, args.reprocess):
+                    print(f"Skipping already processed log {logname}")
+                else:
+                    pending.setdefault(digest, logname)
+            if not pending:
+                return
 
-downloads = []
-for logname in args.logfiles:
-    d = flathub.parse_log(logname, refs_cache, args.ignore_deltas)
-    downloads = downloads + d
+            cache = flathub.load_cache(args.ref_cache_path)
+            flathub.prepare_logs(pending.values(), cache)
+            reports = []
+            with store.db:
+                touched = set()
+                for digest, logname in pending.items():
+                    days = {}
+                    quality = Counter()
+                    observed_digest = hashlib.sha256()
+                    for event in flathub.parse_log(
+                        logname,
+                        cache,
+                        args.ignore_deltas,
+                        quality=quality,
+                        prepared=True,
+                        digest=observed_digest,
+                    ):
+                        date = event[flathub.DATE]
+                        if date not in days:
+                            days[date] = DayInfo(date)
+                        days[date].add(event)
+                    if observed_digest.hexdigest() != digest:
+                        raise ValueError(f"Log changed during processing: {logname}")
+                    touched.update(
+                        store.replace_input(
+                            digest,
+                            logname,
+                            args.ignore_deltas,
+                            dict(quality),
+                            {date: day.to_dict() for date, day in days.items()},
+                        )
+                    )
+                    reports.append((logname, dict(quality)))
+                store.rebuild_days(touched, lambda date: DayInfo(date).to_dict())
+                cache.save(args.ref_cache_path)
 
-refs_cache.save(args.ref_cache_path)
+            store.publish()
+            for logname, quality in reports:
+                print(f"Quality {logname}: {json.dumps(quality, sort_keys=True)}")
+            print(f"Metadata resolution failures: {cache.resolution_failures}")
 
-days = {}
 
-for d in downloads:
-    date = d[flathub.DATE]
-    day = days.get(date)
-    if not day:
-        day = load_dayinfo(args.dest, date)
-        days[date] = day
-    day.add(d)
-
-for date in days:
-    day = days[date]
-    path = os.path.join(args.dest, date + ".json")
-    directory = os.path.dirname(path)
-    if not os.path.exists(directory):
-        os.makedirs(directory, 0o755)
-    print(f"saving updated stats {path}")
-    with open(path, "w") as f:
-        json.dump(day, f, default=lambda x: x.__dict__, sort_keys=True, indent=4)
+if __name__ == "__main__":
+    main()

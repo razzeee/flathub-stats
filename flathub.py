@@ -3,15 +3,44 @@
 import base64
 import binascii
 import gzip
+import hashlib
 import json
+import lzma
 import re
 import sys
 import time
 import urllib.error
-import urllib.parse
 import urllib.request
+from collections import Counter
 
 from gi.repository import GLib  # type: ignore[import-untyped]
+
+from stats_store import atomic_json_write
+
+
+def fetch_metadata(url):
+    """Bound network stalls and retry transient failures, not missing objects."""
+    for attempt in range(3):
+        try:
+            with urllib.request.urlopen(url, timeout=15) as response:
+                data = response.read()
+                if not data:
+                    raise OSError(f"Empty metadata response: {url}")
+                return data
+        except OSError as error:
+            if isinstance(error, urllib.error.HTTPError) and error.code not in (
+                408,
+                429,
+                500,
+                502,
+                503,
+                504,
+            ):
+                raise
+            if attempt == 2:
+                raise
+            time.sleep(0.5 * (attempt + 1))
+    raise AssertionError("unreachable")
 
 
 def load_cache(path):
@@ -20,9 +49,8 @@ def load_cache(path):
         print(f"Loading cache from {path}")
         with open(path) as f:
             commit_map = json.loads(f.read())
-    except OSError:
-        print("Failed to load cache")
-        pass
+    except FileNotFoundError:
+        print("Starting a new commit cache")
 
     return CommitCache(commit_map)
 
@@ -32,51 +60,51 @@ class CommitCache:
         # flatpak_is_valid_arch()
         arch_re = re.compile(r"^[A-Za-z0-9_]+$")
 
-        self.valid_arches: set[str] = set()
-        self.commit_map: dict[str | None, list[str | None]] = commit_map
-        self.dirtree_map: dict[str | None, str | None] = {}
+        self.valid_arches: set[str] = {"x86_64", "aarch64", "i386", "arm"}
+        self.commit_map: dict[str, list[str | None]] = {}
+        self.dirtree_map: dict[str, set[str]] = {}
+        self.failed_commits: set[str] = set()
+        self.resolution_failures = 0
         self.modified = False
 
         try:
             url = "https://dl.flathub.org/repo/summary.idx"
-            response = urllib.request.urlopen(url)
-            summary_idx = response.read()
+            summary_idx = fetch_metadata(url)
 
             if summary_idx:
                 idx_gvar = GLib.Variant.new_from_bytes(
                     GLib.VariantType.new("(a{s(ayaaya{sv})}a{sv})"),
                     GLib.Bytes.new(summary_idx),
-                    True,
+                    False,
                 )
                 sub_sum_arr = idx_gvar.get_child_value(0)
                 for sub_sum_name in sub_sum_arr.keys():
                     if arch_re.fullmatch(sub_sum_name):
                         self.valid_arches.add(sub_sum_name)
-        except OSError as err:
+        except (OSError, GLib.Error) as err:
             print(f"Failed to load summary.idx: {err}")
-            self.valid_arches = {"x86_64", "aarch64"}
 
-        # Backwards compat, re-resolve all commits where we don't have root dirtree info
-        # Also remove uninteresting things from the cache
-        for commit, cached_data in list(self.commit_map.items()):
-            if not isinstance(cached_data, list):
-                ref = cached_data
-                # Older version saved uninteresting refs in the cache, but we don't need them anymore
-                if ref and should_keep_ref(ref, self.valid_arches):
-                    self.update_for_commit(commit, ref)
-                else:
-                    del self.commit_map[commit]
-
-        for commit, cached_data in list(self.commit_map.items()):
-            dirtree = cached_data[1]
+        # Keep legacy ref-only entries as hints rather than treating them as
+        # complete metadata or permanently caching failed resolutions.
+        for commit, cached_data in commit_map.items():
+            pair = cached_data if isinstance(cached_data, list) else [cached_data, None]
+            self.commit_map[commit] = pair
+            ref, dirtree = pair
+            if ref and len(ref.split("/")) == 4:
+                self.valid_arches.add(ref.split("/")[2])
             if dirtree:
-                self.dirtree_map[dirtree] = commit
+                self.dirtree_map.setdefault(dirtree, set()).add(commit)
+
+        # Recover historical roots even when the log supplies only a dirtree
+        # and no ref header. This also preserves the old ref-only cache migration.
+        for commit, (ref, dirtree) in list(self.commit_map.items()):
+            if ref and not dirtree and should_keep_ref(ref, self.valid_arches):
+                self.update_for_commit(commit, ref)
 
         self.summary_map = {}
         url = "https://dl.flathub.org/repo/summary"
         try:
-            response = urllib.request.urlopen(url)
-            summaryv = response.read()
+            summaryv = fetch_metadata(url)
             if summaryv:
                 v = GLib.Variant.new_from_bytes(
                     GLib.VariantType.new("(a(s(taya{sv}))a{sv})"),
@@ -87,7 +115,7 @@ class CommitCache:
                     self.summary_map[m[0]] = binascii.hexlify(
                         bytearray(m[1][1])
                     ).decode("utf-8")
-        except OSError:
+        except (OSError, GLib.Error):
             print("Failed to load summary: ")
             print(sys.exc_info())
             pass
@@ -98,13 +126,14 @@ class CommitCache:
             self.update_for_commit(commit, branch)
 
     def update_for_commit(self, commit: str, known_branch: str | None = None):
-        ref = known_branch
+        if self.has_commit(commit) or commit in self.failed_commits:
+            return
+        ref = known_branch or self.lookup_ref(commit)
         root_dirtree = None
         url = f"https://dl.flathub.org/repo/objects/{commit[0:2]}/{commit[2:]}.commit"
         print(f"Resolving {commit}", end=" ")
         try:
-            response = urllib.request.urlopen(url)
-            commitv = response.read()
+            commitv = fetch_metadata(url)
             if commitv:
                 v = GLib.Variant.new_from_bytes(
                     GLib.VariantType.new("(a{sv}aya(say)sstayay)"),
@@ -116,34 +145,41 @@ class CommitCache:
                 elif "ostree.ref-binding" in v[0]:
                     ref = v[0]["ostree.ref-binding"][0]
                 root_dirtree = binascii.hexlify(bytearray(v[6])).decode("utf-8")
-        except OSError:
+                if not re.fullmatch(r"[a-f0-9]{64}", root_dirtree):
+                    raise ValueError("Invalid root dirtree checksum")
+        except (OSError, GLib.Error, ValueError, IndexError):
             print("Failed to resolve commit")
-            pass
+            self.failed_commits.add(commit)
+            self.resolution_failures += 1
+            return
         print(f"-> {ref}, {root_dirtree}")
         self.modified = True
         self.commit_map[commit] = [ref, root_dirtree]
         if root_dirtree:
-            self.dirtree_map[root_dirtree] = commit
+            self.dirtree_map.setdefault(root_dirtree, set()).add(commit)
 
     def has_commit(self, commit):
-        return commit in self.commit_map
+        pair = self.commit_map.get(commit)
+        return bool(pair and pair[0] and pair[1])
 
     def lookup_ref(self, commit):
         pair = self.commit_map.get(commit, None)
         if pair:
             return pair[0]
 
-    def lookup_by_dirtree(self, dirtree) -> str | None:
-        return self.dirtree_map.get(dirtree, None)
+    def lookup_by_dirtree(self, dirtree, ref=None) -> str | None:
+        commits = self.dirtree_map.get(dirtree, set())
+        if ref:
+            commits = {commit for commit in commits if self.lookup_ref(commit) == ref}
+        # Multiple commits of the same ref can share a root. Different refs
+        # require a request header to disambiguate attribution.
+        if commits and len({self.lookup_ref(commit) for commit in commits}) == 1:
+            return min(commits)
+        return None
 
     def save(self, path):
         if self.modified:
-            try:
-                with open(path, "w") as f:
-                    json.dump(self.commit_map, f, indent=4)
-            except OSError:
-                print("Failed to save cache")
-                pass
+            atomic_json_write(path, self.commit_map)
             self.modified = False
 
 
@@ -181,11 +217,11 @@ fastly_log_re = re.compile(fastly_log_pat)
 
 def deltaid_to_commit(deltaid: str) -> str | None:
     try:
-        if deltaid:
-            return binascii.hexlify(
-                base64.b64decode(deltaid.replace("_", "/") + "=")
-            ).decode("utf-8")
-    except binascii.Error:
+        if re.fullmatch(r"[A-Za-z0-9+_]{43}", deltaid):
+            decoded = base64.b64decode(deltaid.replace("_", "/") + "=", validate=True)
+            if len(decoded) == 32:
+                return decoded.hex()
+    except (binascii.Error, ValueError):
         pass
 
     return None
@@ -194,7 +230,7 @@ def deltaid_to_commit(deltaid: str) -> str | None:
 def should_keep_ref(ref: str, valid_arches: set[str]) -> bool:
     parts = ref.split("/")
 
-    if len(parts) != 4:
+    if len(parts) != 4 or not all(parts):
         return False
 
     ref_kind, ref_id, ref_arch, _ = parts[0], parts[1], parts[2], parts[3]
@@ -209,178 +245,172 @@ def should_keep_ref(ref: str, valid_arches: set[str]) -> bool:
     )
 
 
-def parse_log(logname: str, cache: CommitCache, ignore_deltas=False):
-    print(f"loading log {logname}")
+def open_log(logname):
+    """Read bytes so one invalid UTF-8 line cannot discard adjacent valid lines."""
+    name = str(logname)
+    if name.endswith(".gz"):
+        return gzip.open(name, "rb")
+    if name.endswith(".xz"):
+        return lzma.open(name, "rb")
+    return open(name, "rb")
 
-    downloads = []
 
-    with (
-        gzip.open(logname, "rb") if logname.endswith(".gz") else open(logname)
-    ) as log_file:
-        # detect log type
-        try:
-            first_line = log_file.readline()
-        except UnicodeDecodeError:
-            print(f"Skipping undecodable first line in {logname}")
-            first_line = ""
+def log_digest(logname):
+    digest = hashlib.sha256()
+    with open_log(logname) as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
-        if first_line == "":
-            return []
 
-        first_line_str = (
-            first_line.decode("utf-8") if isinstance(first_line, bytes) else first_line
-        )
-        match = fastly_log_re.match(first_line_str)
-        if match:
-            line_re = fastly_log_re
-        else:
-            raise Exception("Unknown log format")
-
-        while True:
-            if first_line:
-                line = first_line
-                first_line = None
-            else:
-                try:
-                    line = log_file.readline()
-                except UnicodeDecodeError:
-                    print(f"Skipping undecodable line in {logname}")
-                    continue
-
-            if line == "":
-                break
-            line_str = line.decode("utf-8") if isinstance(line, bytes) else line
-            match = line_re.match(line_str)
+def log_matches(logname, quality=None, digest=None):
+    if quality is None:
+        quality = Counter()
+    with open_log(logname) as stream:
+        for line in stream:
+            if digest is not None:
+                digest.update(line)
+            quality["lines"] += 1
+            try:
+                match = fastly_log_re.match(line.decode("utf-8"))
+            except UnicodeDecodeError:
+                match = None
             if not match:
-                sys.stderr.write(f"Warning: Can't match line: {line[:-1]}\n")
+                quality["malformed"] += 1
                 continue
-            op = match.group(3)
-            result = match.group(6)
-            path = match.group(4)
-            if op != "GET" or result != "200":
+            yield match
+
+
+def request_object(path):
+    """Return (kind, checksum, incremental), distinguishing malformed candidates."""
+    if path.startswith("/repo/deltas/") and path.endswith("/superblock"):
+        delta = path[len("/repo/deltas/") : -len("/superblock")].replace("/", "")
+        source, separator, target = delta.partition("-")
+        if separator:
+            commit = deltaid_to_commit(target) if deltaid_to_commit(source) else None
+        else:
+            commit = deltaid_to_commit(source)
+        return "delta", commit, bool(separator)
+    for kind in ("dirtree", "commit"):
+        if path.startswith("/repo/objects/") and path.endswith(f".{kind}"):
+            checksum = path[len("/repo/objects/") : -len(kind) - 1].replace("/", "")
+            return (
+                kind,
+                checksum if re.fullmatch(r"[a-f0-9]{64}", checksum) else None,
+                False,
+            )
+    return None, None, False
+
+
+def prepare_logs(lognames, cache: CommitCache):
+    """Resolve metadata across the entire batch before counting any dirtrees."""
+    for logname in lognames:
+        for match in log_matches(logname):
+            if match.group(3) != "GET" or match.group(6) != "200":
                 continue
-
-            target_ref: str | None = match.group(10)
-            if target_ref is not None and len(target_ref) == 0:
-                target_ref = None
-
-            # Early bailout for uninteresting refs (like locales) to keep work down
-            if target_ref is not None and not should_keep_ref(
-                target_ref, cache.valid_arches
-            ):
+            ref = match.group(10) or None
+            if ref and not should_keep_ref(ref, cache.valid_arches):
                 continue
-
-            # Ensure we have (at least) the current HEAD for this branch cached.
-            # We need this to have any chance to map a dirtree object to the
-            # corresponding ref, because unless we saw the commit id for some
-            # other reason before we will not have resolved it so we can do
-            # the reverse lookup.
-            if target_ref:
-                cache.update_from_summary(target_ref)
-
-            is_delta = False
-            if path.startswith("/repo/deltas/") and path.endswith("/superblock"):
-                if ignore_deltas:
-                    continue
-                delta = path[len("/repo/deltas/") : -len("/superblock")].replace(
-                    "/", ""
-                )
-                if delta.find("-") != -1:
-                    is_delta = True
-                    target = delta[delta.find("-") + 1 :]
-                else:
-                    target = delta
-
-                commit = deltaid_to_commit(target)
-                if not commit:
-                    continue
-
-            elif path.startswith("/repo/objects/") and path.endswith(".dirtree"):
-                dirtree = path[len("/repo/objects/") : -len(".dirtree")].replace(
-                    "/", ""
-                )
-                # Look up via the reverse map for all the commits we've seen so far
-                commit = cache.lookup_by_dirtree(dirtree)
-                if not commit:
-                    continue  # No match, probably not a root dirtree (although could be commit we never saw before)
-            else:
-                # Some other kind of log line, ignore
+            kind, checksum, _ = request_object(match.group(4))
+            if kind is None or checksum is None:
                 continue
+            if ref:
+                cache.update_from_summary(ref)
+            # Commit requests provide historical mappings even without a delta.
+            if kind in ("delta", "commit") and not cache.has_commit(checksum):
+                cache.update_for_commit(checksum, ref)
 
-            # Maybe this is a new commit, if so cache it for future use
-            if not cache.has_commit(commit):
-                cache.update_for_commit(commit, target_ref)
 
-            # Some log entries have no ref specified, if so look it up via the cache
-            if not target_ref:
-                target_ref = cache.lookup_ref(commit)
-
-            if not target_ref:
-                print("Unable to figure out ref for commit " + str(commit))
+def parse_log(
+    logname,
+    cache: CommitCache,
+    ignore_deltas=False,
+    *,
+    quality=None,
+    prepared=False,
+    digest=None,
+):
+    """Yield events; prepare a whole batch first to remove file-order dependence."""
+    if not prepared:
+        prepare_logs([logname], cache)
+    if quality is None:
+        quality = Counter()
+    for match in log_matches(logname, quality, digest):
+        if match.group(3) != "GET" or match.group(6) != "200":
+            quality["filtered"] += 1
+            continue
+        target_ref = match.group(10) or None
+        if target_ref and not should_keep_ref(target_ref, cache.valid_arches):
+            quality["filtered"] += 1
+            continue
+        kind, checksum, is_delta = request_object(match.group(4))
+        if kind not in ("delta", "dirtree") or (kind == "delta" and ignore_deltas):
+            quality["filtered"] += 1
+            continue
+        if checksum is None:
+            quality["malformed"] += 1
+            continue
+        if kind == "dirtree":
+            commit = cache.lookup_by_dirtree(checksum, target_ref)
+            if not commit:
+                quality["unresolved_dirtrees"] += 1
                 continue
-
-            # Late bailout, as we're now sure of the ref
-            if not should_keep_ref(target_ref, cache.valid_arches):
-                continue
-
-            date_str = match.group(2)
+        else:
+            commit = checksum
+        if not target_ref:
+            target_ref = cache.lookup_ref(commit)
+        if not target_ref:
+            quality["unresolved_refs"] += 1
+            continue
+        if not should_keep_ref(target_ref, cache.valid_arches):
+            quality["filtered"] += 1
+            continue
+        date_str = match.group(2)
+        try:
             if not date_str.endswith(" +0000"):
-                sys.stderr.write(f"Unhandled date timezone: {date_str}\n")
-                continue
-            date_str = date_str[:-6]
-            date_struct = time.strptime(date_str, "%d/%b/%Y:%H:%M:%S")
-            date = f"{date_struct.tm_year}/{date_struct.tm_mon:02d}/{date_struct.tm_mday:02d}"
+                raise ValueError("Non-UTC timestamp")
+            date_struct = time.strptime(date_str[:-6], "%d/%b/%Y:%H:%M:%S")
+        except ValueError:
+            quality["malformed"] += 1
+            continue
+        date = f"{date_struct.tm_year:04d}/{date_struct.tm_mon:02d}/{date_struct.tm_mday:02d}"
 
-            user_agent = match.group(9)
+        ostree_version = "2017.15"  # Last version that didn't list its version.
+        flatpak_version = None
+        for ua in match.group(9).split():
+            if ua.startswith("libostree/"):
+                ostree_version = ua[10:]
+            if ua.startswith("flatpak/"):
+                flatpak_version = ua[8:]
+        os_id = None
+        os_version = None
+        parts = (match.group(13) or "").split(";")
+        if len(parts) >= 2 and parts[0] and parts[1]:
+            os_id = parts[0]
+            os_version = f"{parts[0]};{parts[1]}"
 
-            uas = user_agent.split(" ")
-            ostree_version = (
-                "2017.15"  # This is the last version that didn't list version
-            )
-            flatpak_version = None
-            for ua in uas:
-                if ua.startswith("libostree/"):
-                    ostree_version = ua[10:]
-                if ua.startswith("flatpak/"):
-                    flatpak_version = ua[8:]
-
-            update_from = match.group(11)
-            if update_from is not None and len(update_from) == 0:
-                update_from = None
-
-            country = match.group(12)
-
-            os_info = match.group(13)
-            os_id = None
-            os_version = None
-            if os_info and len(os_info) > 0:
-                parts = os_info.split(";")
-                if len(parts) >= 2:
-                    os_id = parts[0]
-                    os_version = f"{parts[0]};{parts[1]}"
-
-            is_update = bool(is_delta or update_from)
-            download = (
-                commit,
-                date,
-                target_ref,
-                ostree_version,
-                flatpak_version,
-                is_delta,
-                is_update,
-                country,
-                os_id,
-                os_version,
-            )
-            downloads.append(download)
-
-    return downloads
+        quality["counted"] += 1
+        if not os_version:
+            quality["missing_os"] += 1
+        if not flatpak_version:
+            quality["missing_flatpak_version"] += 1
+        yield (
+            commit,
+            date,
+            target_ref,
+            ostree_version,
+            flatpak_version,
+            is_delta,
+            bool(is_delta or match.group(11)),
+            match.group(12),
+            os_id,
+            os_version,
+        )
 
 
 if __name__ == "__main__":
-    logs = []
+    cache = CommitCache({})
+    prepare_logs(sys.argv[1:], cache)
     for logname in sys.argv[1:]:
-        log = parse_log(logname, CommitCache({}))
-        logs = logs + log
-    for log in logs:
-        print(log)
+        for log in parse_log(logname, cache, prepared=True):
+            print(log)
