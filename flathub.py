@@ -212,8 +212,6 @@ def should_keep_ref(ref: str, valid_arches: set[str]) -> bool:
 def parse_log(logname: str, cache: CommitCache, ignore_deltas=False):
     print(f"loading log {logname}")
 
-    downloads = []
-
     with (
         gzip.open(logname, "rb") if logname.endswith(".gz") else open(logname)
     ) as log_file:
@@ -225,7 +223,7 @@ def parse_log(logname: str, cache: CommitCache, ignore_deltas=False):
             first_line = ""
 
         if first_line == "":
-            return []
+            return
 
         first_line_str = (
             first_line.decode("utf-8") if isinstance(first_line, bytes) else first_line
@@ -372,15 +370,10 @@ def parse_log(logname: str, cache: CommitCache, ignore_deltas=False):
                 os_id,
                 os_version,
             )
-            downloads.append(download)
-
-    return downloads
+            yield download
 
 
 if __name__ == "__main__":
-    logs = []
     for logname in sys.argv[1:]:
-        log = parse_log(logname, CommitCache({}))
-        logs = logs + log
-    for log in logs:
-        print(log)
+        for log in parse_log(logname, CommitCache({})):
+            print(log)

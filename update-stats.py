@@ -214,22 +214,17 @@ args = parser.parse_args()
 
 refs_cache = flathub.load_cache(args.ref_cache_path)
 
-downloads = []
+days = {}
 for logname in args.logfiles:
-    d = flathub.parse_log(logname, refs_cache, args.ignore_deltas)
-    downloads = downloads + d
+    for d in flathub.parse_log(logname, refs_cache, args.ignore_deltas):
+        date = d[flathub.DATE]
+        day = days.get(date)
+        if not day:
+            day = load_dayinfo(args.dest, date)
+            days[date] = day
+        day.add(d)
 
 refs_cache.save(args.ref_cache_path)
-
-days = {}
-
-for d in downloads:
-    date = d[flathub.DATE]
-    day = days.get(date)
-    if not day:
-        day = load_dayinfo(args.dest, date)
-        days[date] = day
-    day.add(d)
 
 for date in days:
     day = days[date]
