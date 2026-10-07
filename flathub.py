@@ -4,6 +4,7 @@ import base64
 import binascii
 import gzip
 import json
+import lzma
 import re
 import sys
 import time
@@ -209,48 +210,29 @@ def should_keep_ref(ref: str, valid_arches: set[str]) -> bool:
     )
 
 
+def open_log(logname):
+    """Read bytes so one invalid UTF-8 line cannot discard adjacent valid lines."""
+    name = str(logname)
+    if name.endswith(".gz"):
+        return gzip.open(name, "rb")
+    if name.endswith(".xz"):
+        return lzma.open(name, "rb")
+    return open(name, "rb")
+
+
 def parse_log(logname: str, cache: CommitCache, ignore_deltas=False):
     print(f"loading log {logname}")
 
     downloads = []
 
-    with (
-        gzip.open(logname, "rb") if logname.endswith(".gz") else open(logname)
-    ) as log_file:
-        # detect log type
-        try:
-            first_line = log_file.readline()
-        except UnicodeDecodeError:
-            print(f"Skipping undecodable first line in {logname}")
-            first_line = ""
-
-        if first_line == "":
-            return []
-
-        first_line_str = (
-            first_line.decode("utf-8") if isinstance(first_line, bytes) else first_line
-        )
-        match = fastly_log_re.match(first_line_str)
-        if match:
-            line_re = fastly_log_re
-        else:
-            raise Exception("Unknown log format")
-
-        while True:
-            if first_line:
-                line = first_line
-                first_line = None
-            else:
-                try:
-                    line = log_file.readline()
-                except UnicodeDecodeError:
-                    print(f"Skipping undecodable line in {logname}")
-                    continue
-
-            if line == "":
-                break
-            line_str = line.decode("utf-8") if isinstance(line, bytes) else line
-            match = line_re.match(line_str)
+    with open_log(logname) as log_file:
+        for line in log_file:
+            try:
+                line_str = line.decode("utf-8")
+            except UnicodeDecodeError:
+                print(f"Skipping undecodable line in {logname}")
+                continue
+            match = fastly_log_re.match(line_str)
             if not match:
                 sys.stderr.write(f"Warning: Can't match line: {line[:-1]}\n")
                 continue
